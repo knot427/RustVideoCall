@@ -1,0 +1,14 @@
+[package]
+name = "recived"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+num_cpus = "*"
+
+[dependencies.nokhwa]
+version = "0.10.3"
+features = ["input-native", "decoding", "output-threaded"]
+
