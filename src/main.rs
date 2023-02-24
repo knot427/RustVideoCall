@@ -1,52 +1,96 @@
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::query;
-use nokhwa::utils::ApiBackend;
+use nokhwa::Camera;
+
+use nokhwa::utils::CameraIndex;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
-use nokhwa::CallbackCamera;
+
 use std::io::prelude::*;
 use std::net::TcpListener;
 use std::net::TcpStream;
-use std::sync::Arc;
-use std::sync::Mutex;
+
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:7878").unwrap();
 
-    let connections: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(vec![]));
+    let (tx, rx): (Sender<TcpStream>, Receiver<TcpStream>) = mpsc::channel();
 
-    let cameras = query(ApiBackend::Auto).unwrap();
-    cameras.iter().for_each(|cam| println!("{cam:?}"));
+    thread::spawn(move || {
+        let mut connections: Vec<TcpStream> = vec![];
 
-    let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        loop {
+            println!("Waiting for connection");
+            match rx.recv() {
+                Ok(stream) => {
+                    connections.push(stream);
+                }
+                Err(_) => {
+                    println!("thread failed to recive tcp connection");
+                    break;
+                }
+            };
+            println!("Starting camera");
+            let index = CameraIndex::Index(0);
+            // request the absolute highest resolution CameraFormat that can be decoded to RGB.
+            let requested =
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
 
-    let first_camera = cameras.first().unwrap();
+            // make the camera
+            let mut camera = match Camera::new(index, requested) {
+                Ok(cam) => cam,
+                Err(_) => {
+                    println!("Failed to start camera");
+                    continue;
+                }
+            };
 
-    let camera_connections = connections.clone();
+            loop {
+                let frame = match camera.frame() {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                };
 
-    let mut threaded = CallbackCamera::new(first_camera.index().clone(), format, move |buffer| {
-        let image_buffer = [b"--frame\nContent-Type: image/jpeg\n\n", buffer.buffer()].concat();
-        camera_connections
-            .lock()
-            .unwrap()
-            .iter()
-            .for_each(|mut stream| {
-                stream.write_all(&image_buffer).unwrap();
-            })
-    })
-    .unwrap();
-    threaded.open_stream().unwrap();
+                let frame = [b"--frame\r\nContent-Type: image/jpeg\r\n\r\n", frame.buffer(), b"\r\n"].concat();
+
+                connections = connections
+                    .into_iter()
+                    .filter_map(|mut stream| match stream.write_all(&frame) {
+                        Ok(_) => Option::Some(stream),
+                        Err(_) => Option::None,
+                    })
+                    .collect();
+
+                if let Ok(stream) = rx.recv_timeout(Duration::from_millis(1)) {
+                    connections.push(stream)
+                };
+                if connections.is_empty() {
+                    println!("no active connections, closing camera");
+                    break;
+                }
+            }
+        }
+    });
 
     for stream in listener.incoming() {
-        let stream = stream.unwrap();
-        handle_connection(stream, connections.clone());
+        let mut stream = stream.unwrap();
+        let messgage =
+            b"HTTP/1.1 200 OK\nContent-Type: multipart/x-mixed-replace; boundary=frame\n\n";
+        match stream.write_all(messgage) {
+            Ok(_) => {}
+            Err(_) => continue,
+        };
+        match tx.send(stream) {
+            Ok(_) => {}
+            Err(_) => {
+                println!("failed to send connection to thread");
+                break;
+            }
+        };
     }
 
     println!("Shutting down.");
-}
-
-fn handle_connection(mut stream: TcpStream, connections: Arc<Mutex<Vec<TcpStream>>>) {
-    let messgage = b"HTTP/1.1 200 OK\nContent-Type: multipart/x-mixed-replace; boundary=frame\n\n";
-    stream.write_all(messgage).unwrap();
-    connections.lock().unwrap().push(stream);
 }
